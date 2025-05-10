@@ -1,35 +1,87 @@
+import os
+
 import geopandas as gpd
 import pandas as pd
 from shapely import wkt
 from shapely.geometry import Point
 from pyproj import Transformer
+import pickle
 
 # Optional: Define transformer for EPSG:25832 -> EPSG:4326
 transformer = Transformer.from_crs("EPSG:25832", "EPSG:4326", always_xy=True)
 
+# print("writing nexiga")
+# # Nexiga Daten laden
+# nexiga = gpd.read_file("daten/hackathon_daten/Datenquellen/Nexiga/nexiga_all.shp")
+# nexiga = nexiga.to_crs("EPSG:4326")
+# nexiga.to_file('nexiga.geojson', driver='GeoJSON')
+#
+# print("writing pv data")
+# # PV daten
+# pv_df = pd.read_csv("daten/strom.csv", delimiter=";")
+# pv_df["geometry"] = pv_df[pv_df["Position"].notnull()]["Position"].astype(str).apply(wkt.loads)
+# gdf = gpd.GeoDataFrame(pv_df, geometry="geometry")
+# gdf.set_crs("EPSG:4326", inplace=True)
+# gdf.to_file("pv.geojson", driver="GeoJSON")
 
-# Nexiga Daten laden
-nexiga = gpd.read_file("daten/hackathon_daten/Datenquellen/Nexiga/nexiga_all.shp")
-nexiga = nexiga.to_crs("EPSG:4326")
-nexiga.to_file('nexiga.geojson', driver='GeoJSON')
-
-gdf2 = gpd.read_file("daten/hackathon_daten/Datenquellen/ALKIS/ALKIS-oE_085310_Ihringen_shp/flurstueck.shp")
-gdf2.to_file('ihringen.geojson', driver='GeoJSON')
-gdf2 = gdf2.to_crs("EPSG:4326")
-
-# Strom / Photovoltaik
-df = pd.read_csv("daten/strom.csv", delimiter=";")
-# Convert WKT column to geometry
-#df["geometry"] = df[df["Position"].notnull()]["Position"].astype(str).apply(wkt.loads)
-#gdf = gpd.GeoDataFrame(df, geometry="geometry")
-# Set CRS to WGS84 (EPSG:4326), common for GPS coordinates
-#gdf.set_crs("EPSG:4326", inplace=True)
-#gdf.to_file("strom.geojson", driver="GeoJSON")
-
+print("Getting addresses for heatpumps")
+# Adressen haben positionen fuer Waermepumpen
 adressen = pd.read_csv("daten/hackathon_daten/Datenquellen/Hauskoordinaten/adressen_bw.txt", delimiter=";")
 
-# Waermepumpen
+# Waermepumpen: position der adressen hinzufuegen
 waerme = pd.read_csv("daten/Wärmepumpen.csv", delimiter=";")
+
+# Normalize and prepare key columns
+adressen["key"] = (
+    adressen["gmd"].str.strip().str.casefold() + "|" +
+    adressen["str"].str.strip().str.casefold() + "|" +
+    adressen["hnr"].astype(str).str.strip()
+)
+
+adressen = adressen[["key", "ostwert", "nordwert"]].copy()
+
+waerme["key"] = (
+    waerme["Gemeinde"].str.strip().str.casefold() + "|" +
+    waerme["Straßenname"].str.strip().str.casefold() + "|" +
+    waerme["Hausnummer"].astype(str).str.strip()
+)
+
+print("converting datetimes for geojson")
+waerme["timestamp"] = pd.to_datetime(waerme["Einbaudatum"], dayfirst=True, errors="coerce")
+
+def to_wgs84_wkt(row):
+    try:
+        x, y = float(row["ostwert"]), float(row["nordwert"])
+        lon, lat = transformer.transform(x, y)
+        return Point(lon, lat).wkt
+    except:
+        return None
+
+print("creating address dictionary")
+coord_dict = None
+
+if not os.path.isfile("address_dict.pkl"):
+    coord_dict = {
+        row["key"]: to_wgs84_wkt(row)
+        for _, row in adressen.iterrows()
+    }
+    with open("address_dict.pkl", "wb") as f:
+        pickle.dump(coord_dict, f)
+else:
+    with open("address_dict.pkl", "rb") as f:
+        coord_dict = pickle.load(f)
+
+print("mapping heatpump address to location")
+waerme["Position"] = waerme["key"].map(coord_dict)
+
+waerme["Einbaudatum"] = pd.to_datetime(waerme["Einbaudatum"], dayfirst=True, errors="coerce")
+
+waerme["geometry"] = waerme[waerme["Position"].notnull()]["Position"].astype(str).apply(wkt.loads)
+
+waerme_gdf = gpd.GeoDataFrame(waerme, geometry="geometry", crs="EPSG:4326")
+waerme_gdf = waerme_gdf.dropna(subset=["geometry"])
+
+waerme_gdf.to_file("waerme.geojson", driver="GeoJSON")
 
 def address_to_Point(stadt, strasse, hausnummer):
     adressen["street"] = strasse
@@ -40,43 +92,7 @@ def address_to_Point(stadt, strasse, hausnummer):
         ]
     return Point(float(result["ostwert"]), float(result["nordwert"])).wkt
 
-print(address_to_Point("Weisweil", "Friedhofstraße", 11))
-
-# Normalize and prepare key columns
-adressen["key"] = (
-    adressen["gmd"].str.strip().str.casefold() + "|" +
-    adressen["str"].str.strip().str.casefold() + "|" +
-    adressen["hnr"].astype(str).str.strip()
-)
-
-waerme["key"] = (
-    waerme["Gemeinde"].str.strip().str.casefold() + "|" +
-    waerme["Straßenname"].str.strip().str.casefold() + "|" +
-    waerme["Hausnummer"].astype(str).str.strip()
-)
-
-waerme["timestamp"] = pd.to_datetime(waerme["Einbaudatum"], dayfirst=True, errors="coerce")
-adressen = adressen[["key", "ostwert", "nordwert"]].copy()
-
-def to_wgs84_wkt(row):
-    try:
-        x, y = float(row["ostwert"]), float(row["nordwert"])
-        lon, lat = transformer.transform(x, y)
-        return Point(lon, lat).wkt
-    except:
-        return None
-
-coord_dict = {
-    row["key"]: to_wgs84_wkt(row)
-    for _, row in adressen.iterrows()
-}
-
-waerme["Position"] = waerme["key"].map(coord_dict)
-
-waerme["geometry"] = waerme["Position"].apply(wkt.loads)
-waerme_gdf = gpd.GeoDataFrame(waerme, geometry="geometry", crs="EPSG:4326")
-waerme_gdf = waerme_gdf.dropna(subset=["geometry"])
-waerme_gdf.to_file("waerme.geojson", driver="GeoJSON")
+#print(address_to_Point("Weisweil", "Friedhofstraße", 11))
 
 # adressen["gmd"] = adressen["gmd"].str.strip().str.casefold()
 # adressen["str"] = adressen["str"].str.strip().str.casefold()
